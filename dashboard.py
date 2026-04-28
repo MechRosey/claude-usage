@@ -10,6 +10,7 @@ from pathlib import Path
 from datetime import datetime
 
 DB_PATH = Path.home() / ".claude" / "usage.db"
+CHART_JS = Path(__file__).parent / "chart.umd.min.js"
 
 
 def get_dashboard_data(db_path=DB_PATH):
@@ -127,7 +128,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Claude Code Usage Dashboard</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="/chart.umd.min.js"></script>
 <style>
   :root {
     --bg: #0f1117;
@@ -1247,6 +1248,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(HTML_TEMPLATE.encode("utf-8"))
+
+        elif self.path == "/chart.umd.min.js":
+            body = CHART_JS.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/javascript")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         elif self.path == "/api/data":
             data = get_dashboard_data()
