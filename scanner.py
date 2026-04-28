@@ -246,10 +246,9 @@ def aggregate_sessions(session_metas, turns):
 
 def upsert_sessions(conn, sessions):
     for s in sessions:
-        # Check if session exists
         existing = conn.execute(
             "SELECT total_input_tokens, total_output_tokens, total_cache_read, "
-            "total_cache_creation, turn_count FROM sessions WHERE session_id = ?",
+            "total_cache_creation, turn_count, model FROM sessions WHERE session_id = ?",
             (s["session_id"],)
         ).fetchone()
 
@@ -268,12 +267,8 @@ def upsert_sessions(conn, sessions):
                 s["model"], s["turn_count"]
             ))
         else:
-            # Update: add new tokens on top of existing (since we only insert new turns)
             # Keep the highest-priority model (e.g. opus over haiku from subagents)
-            existing_model = conn.execute(
-                "SELECT model FROM sessions WHERE session_id = ?",
-                (s["session_id"],)
-            ).fetchone()["model"]
+            existing_model = existing["model"]
             new_model = s["model"]
             if _model_priority(new_model) > _model_priority(existing_model):
                 model_to_set = new_model
@@ -339,6 +334,7 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
     skipped_files = 0
     total_turns = 0
     total_sessions = set()
+    files_since_commit = 0
 
     for filepath in jsonl_files:
         try:
@@ -467,7 +463,6 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
                 # File didn't grow (mtime changed but no new content)
                 conn.execute("UPDATE processed_files SET mtime = ? WHERE path = ?",
                              (mtime, filepath))
-                conn.commit()
                 skipped_files += 1
                 continue
 
@@ -487,7 +482,12 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
             INSERT OR REPLACE INTO processed_files (path, mtime, lines)
             VALUES (?, ?, ?)
         """, (filepath, mtime, line_count))
-        conn.commit()
+        files_since_commit += 1
+        if files_since_commit >= 50:
+            conn.commit()
+            files_since_commit = 0
+
+    conn.commit()
 
     # Recompute session totals from actual turns in DB.
     # This ensures correctness when INSERT OR IGNORE skips duplicate turns
