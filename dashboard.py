@@ -61,7 +61,10 @@ def get_dashboard_data(db_path=DB_PATH):
             substr(timestamp, 1, 10)                  as day,
             CAST(substr(timestamp, 12, 2) AS INTEGER) as hour,
             COALESCE(model, 'unknown')                as model,
+            SUM(input_tokens)                         as input,
             SUM(output_tokens)                        as output,
+            SUM(cache_read_tokens)                    as cache_read,
+            SUM(cache_creation_tokens)                as cache_creation,
             COUNT(*)                                  as turns
         FROM turns
         WHERE timestamp IS NOT NULL AND length(timestamp) >= 13
@@ -70,11 +73,14 @@ def get_dashboard_data(db_path=DB_PATH):
     """).fetchall()
 
     hourly_by_model = [{
-        "day":    r["day"],
-        "hour":   r["hour"] if r["hour"] is not None else 0,
-        "model":  r["model"],
-        "output": r["output"] or 0,
-        "turns":  r["turns"] or 0,
+        "day":            r["day"],
+        "hour":           r["hour"] if r["hour"] is not None else 0,
+        "model":          r["model"],
+        "input":          r["input"] or 0,
+        "output":         r["output"] or 0,
+        "cache_read":     r["cache_read"] or 0,
+        "cache_creation": r["cache_creation"] or 0,
+        "turns":          r["turns"] or 0,
     } for r in hourly_rows]
 
     # ── All sessions (client filters by range and model) ──────────────────────
@@ -236,6 +242,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="filter-sep"></div>
   <div class="filter-label">Range</div>
   <div class="range-group">
+    <button class="range-btn" data-range="today" onclick="setRange('today')">Today</button>
     <button class="range-btn" data-range="week" onclick="setRange('week')">This Week</button>
     <button class="range-btn" data-range="month" onclick="setRange('month')">This Month</button>
     <button class="range-btn" data-range="prev-month" onclick="setRange('prev-month')">Prev Month</button>
@@ -482,8 +489,8 @@ const TOKEN_COLORS = {
 const MODEL_COLORS = ['#d97757','#4f8ef7','#4ade80','#a78bfa','#fbbf24','#f472b6','#34d399','#60a5fa'];
 
 // ── Time range ─────────────────────────────────────────────────────────────
-const RANGE_LABELS = { 'week': 'This Week', 'month': 'This Month', 'prev-month': 'Previous Month', '7d': 'Last 7 Days', '30d': 'Last 30 Days', '90d': 'Last 90 Days', 'all': 'All Time' };
-const RANGE_TICKS  = { 'week': 7, 'month': 15, 'prev-month': 15, '7d': 7, '30d': 15, '90d': 13, 'all': 12 };
+const RANGE_LABELS = { 'today': 'Today', 'week': 'This Week', 'month': 'This Month', 'prev-month': 'Previous Month', '7d': 'Last 7 Days', '30d': 'Last 30 Days', '90d': 'Last 90 Days', 'all': 'All Time' };
+const RANGE_TICKS  = { 'today': 24, 'week': 7, 'month': 15, 'prev-month': 15, '7d': 7, '30d': 15, '90d': 13, 'all': 12 };
 const VALID_RANGES = Object.keys(RANGE_LABELS);
 
 function rangeIncludesToday(range) {
@@ -499,6 +506,10 @@ function getRangeBounds(range) {
   if (range === 'all') return { start: null, end: null };
   const today = new Date();
   const iso = d => d.toISOString().slice(0, 10);
+  if (range === 'today') {
+    const t = iso(today);
+    return { start: t, end: t };
+  }
   if (range === 'week') {
     const day = today.getDay();
     const diffToMon = day === 0 ? 6 : day - 1;
@@ -743,16 +754,34 @@ function applyFilter() {
 
   // Hourly aggregation (filtered by model + range, then bucketed by UTC hour)
   const hourlySrc = (rawData.hourly_by_model || []).filter(r =>
-    selectedModels.has(r.model) && (!start || r.day >= start)
+    selectedModels.has(r.model) && (!start || r.day >= start) && (!end || r.day <= end)
   );
   const hourlyAgg = aggregateHourly(hourlySrc, hourlyTZ);
 
-  // Update daily chart title
-  document.getElementById('daily-chart-title').textContent = 'Daily Token Usage \u2014 ' + RANGE_LABELS[selectedRange];
-  document.getElementById('hourly-chart-title').textContent = 'Average Hourly Distribution \u2014 ' + RANGE_LABELS[selectedRange];
+  // Today: build per-hour full token breakdown for the main chart
+  let todayHours = null;
+  if (selectedRange === 'today') {
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const todaySrc = (rawData.hourly_by_model || []).filter(r =>
+      selectedModels.has(r.model) && r.day === todayStr
+    );
+    todayHours = aggregateTodayHourly(todaySrc, hourlyTZ);
+  }
+
+  // Update chart titles
+  document.getElementById('daily-chart-title').textContent =
+    selectedRange === 'today' ? 'Hourly Token Usage \u2014 Today'
+                              : 'Daily Token Usage \u2014 ' + RANGE_LABELS[selectedRange];
+  document.getElementById('hourly-chart-title').textContent =
+    selectedRange === 'today' ? 'Hourly Distribution \u2014 Today'
+                              : 'Average Hourly Distribution \u2014 ' + RANGE_LABELS[selectedRange];
 
   renderStats(totals);
-  renderDailyChart(daily);
+  if (selectedRange === 'today' && todayHours) {
+    renderTodayChart(todayHours);
+  } else {
+    renderDailyChart(daily);
+  }
   renderHourlyChart(hourlyAgg);
   renderModelChart(byModel);
   renderProjectChart(byProject);
@@ -810,6 +839,58 @@ function aggregateHourly(rows, tzMode) {
     });
   }
   return { hours, dayCount };
+}
+
+function aggregateTodayHourly(rows, tzMode) {
+  const byHour = {};
+  for (let h = 0; h < 24; h++) byHour[h] = { input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0 };
+  for (const r of rows) {
+    const displayHour = utcHourToDisplay(r.hour, tzMode);
+    byHour[displayHour].input          += r.input          || 0;
+    byHour[displayHour].output         += r.output         || 0;
+    byHour[displayHour].cache_read     += r.cache_read     || 0;
+    byHour[displayHour].cache_creation += r.cache_creation || 0;
+    byHour[displayHour].turns          += r.turns          || 0;
+  }
+  const hours = [];
+  for (let h = 0; h < 24; h++) {
+    hours.push({ hour: h, ...byHour[h], peak: isPeakHour(h, tzMode) });
+  }
+  return hours;
+}
+
+function renderTodayChart(hours) {
+  const ctx = document.getElementById('chart-daily').getContext('2d');
+  if (charts.daily) charts.daily.destroy();
+  const labels = hours.map(h => (h.peak ? '⚡ ' : '') + formatHourLabel(h.hour));
+  charts.daily = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [
+        { label: 'Input',          data: hours.map(h => h.input),          backgroundColor: TOKEN_COLORS.input,          stack: 'io',    yAxisID: 'y1' },
+        { label: 'Output',         data: hours.map(h => h.output),         backgroundColor: TOKEN_COLORS.output,         stack: 'io',    yAxisID: 'y1' },
+        { label: 'Cache Read',     data: hours.map(h => h.cache_read),     backgroundColor: TOKEN_COLORS.cache_read,     stack: 'cache', yAxisID: 'y' },
+        { label: 'Cache Creation', data: hours.map(h => h.cache_creation), backgroundColor: TOKEN_COLORS.cache_creation, stack: 'cache', yAxisID: 'y' },
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { labels: { color: '#8892a4', boxWidth: 12 } },
+        tooltip: { callbacks: { title: items => {
+          const h = hours[items[0]?.dataIndex];
+          if (!h) return '';
+          return formatHourLabel(h.hour) + ' ' + tzDisplayName(hourlyTZ) + (h.peak ? ' · Peak' : '');
+        }}}
+      },
+      scales: {
+        x: { ticks: { color: '#8892a4', maxRotation: 0, autoSkip: false, font: { size: 10 } }, grid: { color: '#2a2d3a' } },
+        y:  { position: 'left',  ticks: { color: '#74de80', callback: v => fmt(v) }, grid: { color: '#2a2d3a' }, title: { display: true, text: 'Cache', color: '#74de80' } },
+        y1: { position: 'right', ticks: { color: '#4f8ef7', callback: v => fmt(v) }, grid: { drawOnChartArea: false },    title: { display: true, text: 'Input / Output', color: '#4f8ef7' } },
+      }
+    }
+  });
 }
 
 function renderHourlyChart(agg) {
